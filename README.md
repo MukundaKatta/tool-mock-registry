@@ -1,81 +1,84 @@
-# token-budget-py
+# tool-mock-registry
 
-[![PyPI](https://img.shields.io/pypi/v/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![Python](https://img.shields.io/pypi/pyversions/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+Mock tool registry for testing agent tool calls. Register mock implementations per tool name, call them through the registry, and verify call counts. Unit-test agent logic without hitting real tool endpoints.
 
-**Thread-safe shared token + USD budget for concurrent LLM tasks.**
-
-Fan-out workloads — agents, parallel summarizers, batch evals — race many
-tasks to consume from one shared budget. This library is a small,
-zero-dependency counter with two axes (tokens, USD) that returns
-`BudgetExceeded` when a record would push past a configured cap.
-
-Sibling to the Rust crate
-[`token-budget-pool`](https://crates.io/crates/token-budget-pool).
+Zero runtime dependencies. Python 3.10+.
 
 ## Install
 
 ```bash
-pip install token-budget-py
+pip install tool-mock-registry
 ```
 
-## Use
+## Quick start
 
 ```python
-from token_budget import BudgetPool, BudgetExceeded
+from tool_mock_registry import MockRegistry
 
-pool = BudgetPool(token_cap=1_000_000, usd_cap=10.0)
+registry = MockRegistry()
+registry.register_return("search", {"results": ["cat", "dog"]})
+registry.register_mock("summarize", lambda **kw: f"Summary of: {kw['text']}")
 
-try:
-    pool.record(tokens=1200, usd=0.0036)
-except BudgetExceeded as e:
-    # tell this worker to skip
-    print(f"out of budget: {e}")
+result = registry.call("search", query="animals")
+registry.assert_called("search", times=1)
+registry.assert_not_called("summarize")
 ```
 
-Two-phase commit (reserve before the LLM call, commit the actual usage):
+## API
+
+### Registration
+
+| Method | Description |
+|---|---|
+| `register_mock(name, fn)` | Register a callable; returns `self` for chaining |
+| `register_return(name, value)` | Always return `value` |
+| `register_error(name, exc)` | Always raise `exc` |
+| `is_mocked(name)` | Check if a tool is registered |
+
+### Invocation
+
+| Method | Description |
+|---|---|
+| `call(name, **kwargs)` | Invoke mock synchronously; raises `ToolNotFoundError` if not registered |
+| `await call_async(name, **kwargs)` | Awaits the mock if it is a coroutine function; otherwise calls it synchronously |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `call_count(name)` | Number of calls for one tool (0 if never called) |
+| `call_counts()` | Dict of all call counts |
+| `call_history(name=None)` | List of `CallRecord`; pass `None` for all tools |
+
+### Assertions
+
+| Method | Description |
+|---|---|
+| `assert_called(name, times=None)` | Fails if never called; with `times`, checks exact count |
+| `assert_not_called(name)` | Fails if called at least once |
+
+### Reset / clear
+
+| Method | Description |
+|---|---|
+| `reset_counts()` | Clear history + counts; keep mocks |
+| `clear_mocks(name=None)` | Remove one mock or all |
+
+### Context manager
+
+`__exit__` calls `reset_counts()` (mocks stay registered).
 
 ```python
-with pool.reserve(tokens=2000, usd=0.012) as r:
-    result = call_llm(prompt)
-    r.commit(tokens=result.usage.total_tokens, usd=result.cost_usd)
+with MockRegistry() as reg:
+    reg.register_return("tool", 42)
+    reg.call("tool")
+    reg.assert_called("tool")
+# counts/history reset; mock still present
 ```
 
-If the `with` block exits without `r.commit()` (e.g. the LLM call raised),
-the reservation is auto-released — no orphaned slots.
+## Thread safety
 
-Either axis is optional:
-
-```python
-only_tokens = BudgetPool(token_cap=500_000)        # USD unbounded
-only_usd    = BudgetPool(usd_cap=5.0)              # tokens unbounded
-unbounded   = BudgetPool()                         # both unbounded (counter only)
-```
-
-Atomic read of current state:
-
-```python
-snap = pool.snapshot()
-snap.tokens_used         # 1200
-snap.usd_remaining       # 9.9964
-snap.tokens_remaining    # 998800 (cap - used - reserved)
-```
-
-## What it does NOT do
-
-- No async runtime lock-in. Works under `asyncio`, `trio`, threads, sync.
-  The internal lock is a plain `threading.Lock` (held only for the
-  microseconds of a counter update).
-- No HTTP. Doesn't talk to any LLM provider.
-- No cost calculation. Wrap a cost calculator that returns USD per call
-  and feed the result into `record`. (See `claude-cost`, `openai-cost`,
-  `gemini-cost`, `bedrock-cost` on crates.io for Rust cost calculators
-  with the same authorship.)
-- No persistence. Counts live in process. For multi-process / multi-host
-  budgets, wrap a Redis or DB increment instead.
-- No automatic rollover. Call `pool.reset()` from your own cron / time
-  loop if you want a periodic window.
+All methods are protected by a re-entrant lock and safe for concurrent use.
 
 ## License
 
