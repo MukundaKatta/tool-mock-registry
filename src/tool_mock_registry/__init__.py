@@ -1,245 +1,162 @@
 """
-tool_mock_registry — Mock tool registry for testing agent tool calls.
-
-Register mock implementations per tool name, call them through the registry,
-and verify call counts. Unit-test agent logic without hitting real tool endpoints.
+tool-mock-registry: Mock tool registry for testing agent tool calls.
 """
+from __future__ import annotations
 
-import inspect
-import threading
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
 
-class ToolNotFoundError(Exception):
-    """Raised when a tool name is not registered in the registry."""
+class ToolNotRegistered(KeyError):
+    pass
+
+
+class AssertionFailed(AssertionError):
+    pass
 
 
 @dataclass
 class CallRecord:
-    """Record of a single tool invocation."""
-
     tool_name: str
-    kwargs: dict
-    result: object
-    error: str | None = None
+    args: dict[str, Any]
+    result: Any
+    raised: Optional[BaseException] = None
 
 
-class MockRegistry:
-    """Thread-safe registry of mock tool implementations.
+class MockTool:
+    """A single registered mock tool."""
+
+    def __init__(
+        self,
+        name: str,
+        return_value: Any = None,
+        side_effect: Optional[Callable[..., Any]] = None,
+        raise_on_call: Optional[BaseException] = None,
+    ) -> None:
+        self.name = name
+        self._return_value = return_value
+        self._side_effect = side_effect
+        self._raise_on_call = raise_on_call
+        self._calls: list[CallRecord] = []
+
+    def __call__(self, **kwargs: Any) -> Any:
+        if self._raise_on_call is not None:
+            self._calls.append(CallRecord(tool_name=self.name, args=kwargs, result=None, raised=self._raise_on_call))
+            raise self._raise_on_call
+        if self._side_effect is not None:
+            result = self._side_effect(**kwargs)
+        else:
+            result = self._return_value
+        self._calls.append(CallRecord(tool_name=self.name, args=kwargs, result=result))
+        return result
+
+    @property
+    def call_count(self) -> int:
+        return len(self._calls)
+
+    @property
+    def calls(self) -> list[CallRecord]:
+        return list(self._calls)
+
+    @property
+    def last_call(self) -> Optional[CallRecord]:
+        return self._calls[-1] if self._calls else None
+
+    def assert_called(self) -> None:
+        if not self._calls:
+            raise AssertionFailed(f"Expected '{self.name}' to have been called, but it was not.")
+
+    def assert_called_once(self) -> None:
+        if self.call_count != 1:
+            raise AssertionFailed(f"Expected '{self.name}' to be called once, but called {self.call_count} times.")
+
+    def assert_called_with(self, **expected_kwargs: Any) -> None:
+        if not self._calls:
+            raise AssertionFailed(f"'{self.name}' was never called.")
+        last = self._calls[-1].args
+        for k, v in expected_kwargs.items():
+            if last.get(k) != v:
+                raise AssertionFailed(f"'{self.name}' last called with {k}={last.get(k)!r}, expected {v!r}.")
+
+    def assert_not_called(self) -> None:
+        if self._calls:
+            raise AssertionFailed(f"Expected '{self.name}' not to be called, but called {self.call_count} times.")
+
+    def reset(self) -> None:
+        self._calls.clear()
+
+
+class MockToolRegistry:
+    """
+    Registry of mock tools for testing agent tool-calling flows.
 
     Usage::
 
-        registry = MockRegistry()
-        registry.register_return("search", {"results": []})
-        result = registry.call("search", query="cats")
-        registry.assert_called("search", times=1)
+        registry = MockToolRegistry()
+        registry.register("search_web", return_value=["result1"])
+        registry.register("send_email", side_effect=lambda to, body: True)
 
-    Can also be used as a context manager; ``__exit__`` resets counts/history
-    while keeping the registered mocks in place.
+        result = registry.call("search_web", query="python")
+        assert result == ["result1"]
+
+        registry.get("search_web").assert_called_once()
     """
 
     def __init__(self) -> None:
-        self._lock = threading.RLock()
-        # tool_name -> callable
-        self._mocks: dict[str, Callable] = {}
-        # tool_name -> call count
-        self._counts: dict[str, int] = {}
-        # flat list of all call records
-        self._history: list[CallRecord] = []
+        self._tools: dict[str, MockTool] = {}
 
-    # ------------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------------
+    def register(
+        self,
+        name: str,
+        return_value: Any = None,
+        side_effect: Optional[Callable[..., Any]] = None,
+        raise_on_call: Optional[BaseException] = None,
+    ) -> MockTool:
+        tool = MockTool(name=name, return_value=return_value, side_effect=side_effect, raise_on_call=raise_on_call)
+        self._tools[name] = tool
+        return tool
 
-    def register_mock(self, tool_name: str, fn: Callable) -> "MockRegistry":
-        """Register a callable as the implementation for *tool_name*.
+    def get(self, name: str) -> MockTool:
+        if name not in self._tools:
+            raise ToolNotRegistered(name)
+        return self._tools[name]
 
-        Returns self so calls can be chained.
-        """
-        with self._lock:
-            self._mocks[tool_name] = fn
-            # Ensure counter entry exists (don't reset if already present)
-            self._counts.setdefault(tool_name, 0)
-        return self
+    def call(self, name: str, **kwargs: Any) -> Any:
+        return self.get(name)(**kwargs)
 
-    def register_return(self, tool_name: str, value: Any) -> "MockRegistry":
-        """Register a mock that always returns *value* for *tool_name*."""
-        return self.register_mock(tool_name, lambda **_kw: value)
+    def has(self, name: str) -> bool:
+        return name in self._tools
 
-    def register_error(self, tool_name: str, exc: Exception) -> "MockRegistry":
-        """Register a mock that always raises *exc* for *tool_name*."""
+    def tool_names(self) -> list[str]:
+        return list(self._tools.keys())
 
-        def _raise(**_kw: Any) -> None:
-            raise exc
+    def reset_all(self) -> None:
+        for tool in self._tools.values():
+            tool.reset()
 
-        return self.register_mock(tool_name, _raise)
+    def all_calls(self) -> list[CallRecord]:
+        result: list[CallRecord] = []
+        for tool in self._tools.values():
+            result.extend(tool.calls)
+        return result
 
-    def is_mocked(self, tool_name: str) -> bool:
-        """Return True if *tool_name* has a registered mock."""
-        with self._lock:
-            return tool_name in self._mocks
+    def assert_tool_called(self, name: str) -> None:
+        self.get(name).assert_called()
 
-    # ------------------------------------------------------------------
-    # Invocation
-    # ------------------------------------------------------------------
+    def assert_tool_not_called(self, name: str) -> None:
+        self.get(name).assert_not_called()
 
-    def call(self, tool_name: str, **kwargs: Any) -> Any:
-        """Invoke the mock registered for *tool_name* with the given kwargs.
-
-        Raises:
-            ToolNotFoundError: if *tool_name* has no registered mock.
-            Exception: whatever the mock raises (after recording the error).
-        """
-        with self._lock:
-            if tool_name not in self._mocks:
-                raise ToolNotFoundError(f"No mock registered for tool '{tool_name}'")
-            fn = self._mocks[tool_name]
-
-        # Call outside the lock so recursive calls don't deadlock
-        try:
-            result = fn(**kwargs)
-            record = CallRecord(tool_name=tool_name, kwargs=kwargs, result=result)
-            with self._lock:
-                self._counts[tool_name] = self._counts.get(tool_name, 0) + 1
-                self._history.append(record)
-            return result
-        except Exception as exc:
-            record = CallRecord(
-                tool_name=tool_name,
-                kwargs=kwargs,
-                result=None,
-                error=str(exc),
-            )
-            with self._lock:
-                self._counts[tool_name] = self._counts.get(tool_name, 0) + 1
-                self._history.append(record)
-            raise
-
-    async def call_async(self, tool_name: str, **kwargs: Any) -> Any:
-        """Async-aware invocation: awaits the mock if it is a coroutine function.
-
-        Raises:
-            ToolNotFoundError: if *tool_name* has no registered mock.
-        """
-        with self._lock:
-            if tool_name not in self._mocks:
-                raise ToolNotFoundError(f"No mock registered for tool '{tool_name}'")
-            fn = self._mocks[tool_name]
-
-        try:
-            if inspect.iscoroutinefunction(fn):
-                result = await fn(**kwargs)
-            else:
-                result = fn(**kwargs)
-            record = CallRecord(tool_name=tool_name, kwargs=kwargs, result=result)
-            with self._lock:
-                self._counts[tool_name] = self._counts.get(tool_name, 0) + 1
-                self._history.append(record)
-            return result
-        except Exception as exc:
-            record = CallRecord(
-                tool_name=tool_name,
-                kwargs=kwargs,
-                result=None,
-                error=str(exc),
-            )
-            with self._lock:
-                self._counts[tool_name] = self._counts.get(tool_name, 0) + 1
-                self._history.append(record)
-            raise
-
-    # ------------------------------------------------------------------
-    # Inspection
-    # ------------------------------------------------------------------
-
-    def call_count(self, tool_name: str) -> int:
-        """Return how many times *tool_name* has been called (0 if never)."""
-        with self._lock:
-            return self._counts.get(tool_name, 0)
-
-    def call_counts(self) -> dict[str, int]:
-        """Return a copy of the call-count dict for all registered mocks."""
-        with self._lock:
-            return dict(self._counts)
-
-    def call_history(self, tool_name: str | None = None) -> list[CallRecord]:
-        """Return a copy of call records, optionally filtered by *tool_name*.
-
-        Pass ``None`` (default) to get all records.
-        """
-        with self._lock:
-            if tool_name is None:
-                return list(self._history)
-            return [r for r in self._history if r.tool_name == tool_name]
-
-    # ------------------------------------------------------------------
-    # Assertions
-    # ------------------------------------------------------------------
-
-    def assert_called(self, tool_name: str, times: int | None = None) -> None:
-        """Assert that *tool_name* was called at least once (or exactly *times*).
-
-        Raises AssertionError on failure.
-        """
-        count = self.call_count(tool_name)
-        if times is None:
-            if count == 0:
-                raise AssertionError(f"Expected '{tool_name}' to be called but it was not.")
-        else:
-            if count != times:
-                raise AssertionError(
-                    f"Expected '{tool_name}' to be called {times} time(s)"
-                    f" but was called {count} time(s)."
-                )
-
-    def assert_not_called(self, tool_name: str) -> None:
-        """Assert that *tool_name* was never called.
-
-        Raises AssertionError if it was called at least once.
-        """
-        count = self.call_count(tool_name)
-        if count > 0:
-            raise AssertionError(
-                f"Expected '{tool_name}' NOT to be called but it was called {count} time(s)."
-            )
-
-    # ------------------------------------------------------------------
-    # Reset / clear
-    # ------------------------------------------------------------------
-
-    def reset_counts(self) -> None:
-        """Clear call history and counts, but keep registered mocks."""
-        with self._lock:
-            self._history.clear()
-            self._counts = {name: 0 for name in self._mocks}
-
-    def clear_mocks(self, tool_name: str | None = None) -> None:
-        """Remove registered mock(s).
-
-        Pass a *tool_name* to remove only that mock; pass ``None`` to remove all.
-        """
-        with self._lock:
-            if tool_name is None:
-                self._mocks.clear()
-                self._counts.clear()
-                self._history.clear()
-            else:
-                self._mocks.pop(tool_name, None)
-                self._counts.pop(tool_name, None)
-                self._history = [r for r in self._history if r.tool_name != tool_name]
-
-    # ------------------------------------------------------------------
-    # Context manager
-    # ------------------------------------------------------------------
-
-    def __enter__(self) -> "MockRegistry":
+    def __enter__(self) -> "MockToolRegistry":
         return self
 
     def __exit__(self, *args: Any) -> None:
-        """Reset counts and history on exit (mocks stay registered)."""
-        self.reset_counts()
+        self.reset_all()
+
+    def __len__(self) -> int:
+        return len(self._tools)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._tools
 
 
-__all__ = ["MockRegistry", "CallRecord", "ToolNotFoundError"]
+__all__ = ["MockToolRegistry", "MockTool", "CallRecord", "ToolNotRegistered", "AssertionFailed"]
